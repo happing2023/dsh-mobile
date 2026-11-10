@@ -88,8 +88,21 @@ jobs:
         if: steps.fetch.outputs.ok == 'true'
         run: |
           set -euo pipefail
-          git push --force --tags origin
-          echo "tag 已推送，当前数量：$(git tag --list | wc -l)"
+          # 逐个推送 tag。整体 `git push --tags` 有一个坏 tag 会连带整条失败：
+          # 某些上游 tag 指向「改过 .github/workflows/」的提交，推送它的对象同样被
+          # GITHUB_TOKEN 的 workflows 限制拒绝，而这类 tag 我们本来也无法镜像。
+          # 所以逐个推，只跳过被拒的那几个，其余照常同步。
+          skipped=0
+          pushed=0
+          for t in $(git tag --list); do
+            if git push --force origin "refs/tags/${t}" >/dev/null 2>&1; then
+              pushed=$((pushed+1))
+            else
+              skipped=$((skipped+1))
+              echo "::warning::tag ${t} 跳过（指向含 workflow 变更的提交，token 无权推送）"
+            fi
+          done
+          echo "tag 已推送 ${pushed} 个，跳过 ${skipped} 个，本地总数：$(git tag --list | wc -l)"
 
       - name: Warn when upstream is gone
         if: steps.fetch.outputs.ok != 'true'
