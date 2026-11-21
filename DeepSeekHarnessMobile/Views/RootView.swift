@@ -78,12 +78,13 @@ struct AppConnectionLifecycleModifier: ViewModifier {
 /// The navigation tree deliberately holds `AppStore` as an unobserved
 /// reference. `RootView` can still present global errors, while session/history
 /// publications no longer invalidate the `NavigationStack` that owns the bar.
-private struct RootNavigationHost: View, Equatable {
+struct RootNavigationHost: View, Equatable {
     let store: AppStore
     /// Unobserved like `store`: only read when a deep link arrives, so gateway list
     /// publications must not invalidate the navigation tree.
     let hosts: MultiGatewayStore
     @State private var navigationPath: [AppRoute] = []
+    @AppStorage("app.bot-mode") private var botMode = false
     @State private var newConversationTask: Task<Void, Never>?
     /// 侧栏切换 / 新建会话的当前操作编号：被取消的旧任务收尾时，
     /// 只有编号仍是自己的才清空 newConversationTask，避免误清掉新任务的句柄。
@@ -99,44 +100,49 @@ private struct RootNavigationHost: View, Equatable {
 
     var body: some View {
         NavigationStack(path: $navigationPath) {
-            WorkspaceView(
-                onOpenSession: { session in
-                    newConversationTask?.cancel()
-                    let header = conversationHeader(for: session)
-                    Task { @MainActor in
-                        guard await store.prepareConversation(for: session),
-                              !Task.isCancelled else { return }
-                        navigate(to: .conversation(header))
-                    }
-                },
-                onNewSession: {
-                    guard newConversationTask == nil else { return }
-                    let operationID = UUID()
-                    conversationOperationID = operationID
-                    newConversationTask = Task { @MainActor in
-                        defer { if conversationOperationID == operationID { newConversationTask = nil } }
-                        guard await store.prepareNewConversation(),
-                              !Task.isCancelled else { return }
-                        let header = ConversationNavigationHeader(
-                            sessionID: store.selectedSessionId,
-                            title: String(localized: "session.new.fallback", defaultValue: "新建 DeepSeek Harness"),
-                            agentPresetTitle: agentPresetDisplayName(for: store.agentPresetDefault)
-                        )
-                        navigate(to: .conversation(header))
-                    }
-                },
-                onSettings: {
-                    newConversationTask?.cancel()
-                    navigate(to: .settings)
-                },
-                onPlugins: {
-                    navigate(to: .plugins)
-                },
-                onScheduledTasks: {
-                    navigate(to: .scheduledTasks)
-                },
-                onConnectors: { navigate(to: .connectors) }
-            )
+            Group {
+                    WorkspaceView(
+                        onOpenSession: { session in
+                            newConversationTask?.cancel()
+                            let header = conversationHeader(for: session)
+                            Task { @MainActor in
+                                guard await store.prepareConversation(for: session),
+                                      !Task.isCancelled else { return }
+                                navigate(to: .conversation(header))
+                            }
+                        },
+                        onNewSession: {
+                            guard newConversationTask == nil else { return }
+                            let operationID = UUID()
+                            conversationOperationID = operationID
+                            newConversationTask = Task { @MainActor in
+                                defer { if conversationOperationID == operationID { newConversationTask = nil } }
+                                guard await store.prepareNewConversation(),
+                                      !Task.isCancelled else { return }
+                                let header = ConversationNavigationHeader(
+                                    sessionID: store.selectedSessionId,
+                                    title: String(localized: "session.new.fallback", defaultValue: "新建 DeepSeek Harness"),
+                                    agentPresetTitle: agentPresetDisplayName(for: store.agentPresetDefault)
+                                )
+                                navigate(to: .conversation(header))
+                            }
+                        },
+                        onSettings: {
+                            newConversationTask?.cancel()
+                            navigate(to: .settings)
+                        },
+                        onPlugins: {
+                            navigate(to: .plugins)
+                        },
+                        onScheduledTasks: {
+                            navigate(to: .scheduledTasks)
+                        },
+                        onConnectors: { navigate(to: .connectors) },
+                        onBotMode: { botMode = true },
+                        isBotMode: botMode,
+                        onStandardMode: { botMode = false }
+                    )
+            }
                 .navigationDestination(for: AppRoute.self) { route in
                     destination(for: route)
                 }
@@ -1107,7 +1113,7 @@ private struct ScheduledTaskEditSheet: View {
             .scrollDismissesKeyboard(.interactively)
         }
         .background(Color(uiColor: .systemBackground))
-        .background(ScheduleKeyboardDismissProbe())
+        .background(KeyboardDismissProbe())
         .interactiveDismissDisabled(pendingRequestID != nil)
         .onChangeCompat(of: store.scheduledTaskCompletedRequestID) { _, completedID in
             if completedID != nil && completedID == pendingRequestID { dismiss() }
@@ -1266,7 +1272,7 @@ private struct ScheduleWorkspacePicker: View {
             .navigationTitle("关联工作区").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } } }
         }
-        .background(ScheduleKeyboardDismissProbe())
+        .background(KeyboardDismissProbe())
     }
 }
 
@@ -1537,7 +1543,7 @@ private struct ScheduleTimeZonePicker: View {
             .navigationTitle("时区").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } } }
         }
-        .background(ScheduleKeyboardDismissProbe())
+        .background(KeyboardDismissProbe())
     }
 }
 
@@ -1668,10 +1674,8 @@ private struct ConversationNavigationShell<Content: View>: View {
     @State private var compactHeader = false
 
     var body: some View {
-        GeometryReader { geometry in
-            // 视口可滚入导航栏和状态栏后方，首屏的可读边界仍由内容 inset 保留。
-            content($activeView, geometry.safeAreaInsets.top)
-                .ignoresSafeArea(.container, edges: .top)
+        ConversationTopSafeArea { topInset in
+            content($activeView, topInset)
         }
             .onGeometryChange(for: CGSize.self) { geometry in
                 geometry.size
@@ -3010,7 +3014,7 @@ private struct ScheduleCreateForm: View {
 }
 
 /// 只处理当前编辑页内的非输入区轻触，不拦截输入、选区、滚动或按钮事件。
-struct ScheduleKeyboardDismissProbe: UIViewRepresentable {
+struct KeyboardDismissProbe: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeUIView(context: Context) -> ProbeView {
         let view = ProbeView()

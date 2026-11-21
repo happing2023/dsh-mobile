@@ -120,7 +120,8 @@ class GatewayRuntime(
     private val trustedEndpoints: List<String> = emptyList(),
     private val onIdentity: suspend (GatewayFrame, String) -> Unit = { _, _ -> },
     private val foregroundProbeTimeoutMilliseconds: Long = DEFAULT_FOREGROUND_PROBE_TIMEOUT_MILLISECONDS,
-    private val diagnosticsNow: () -> Double = createNetworkDiagnosticsClock()
+    private val diagnosticsNow: () -> Double = createNetworkDiagnosticsClock(),
+    private var selectedConnectionMethod: GatewayConnectionMethod? = null
 ) {
     private val diagnosticsStore = NetworkDiagnosticsStore()
     private var diagnosticsLease = 0L
@@ -267,10 +268,17 @@ class GatewayRuntime(
         collectSafely(networkMonitor.state, ERROR_NETWORK_FLOW, handler = ::handleNetworkLocked)
     }
 
-    suspend fun connect(endpoint: String) = serialized {
+    suspend fun connect(endpoint: String, connectionMethod: GatewayConnectionMethod? = null) = serialized {
         requireWebSocketEndpoint(endpoint)
         if (trustedEndpoints.isNotEmpty() && endpoint !in trustedEndpoints) {
             throw GatewayPairingPayloadException(UiMessage("gateway.endpointUntrusted"), "Address not confirmed by this host")
+        }
+        if (connectionMethod != null) {
+            selectedConnectionMethod = connectionMethod
+            if (this.endpoint == endpoint && mutableState.value.connection in setOf(
+                    GatewayConnectionState.CONNECTED, GatewayConnectionState.CONNECTING, GatewayConnectionState.AUTHENTICATING
+                )
+            ) return@serialized
         }
         cancelForegroundResumeLocked()
         lastConnectedEndpoint = null
@@ -818,6 +826,11 @@ class GatewayRuntime(
             recoveryDeadlineJob?.cancel()
             recoveryDeadlineJob = null
             lastConnectedEndpoint = endpoint
+            val connected = endpoint
+            if (connected != null && connected in trustedEndpoints) {
+                val stored = preferences.load()
+                if (stored.endpoint != connected) preferences.update(stored.copy(endpoint = connected))
+            }
             mutableState.value = mutableState.value.copy(
                 connection = GatewayConnectionState.CONNECTED,
                 serverPort = frame.port,
@@ -838,6 +851,7 @@ class GatewayRuntime(
         if (!correlation.accepted) return null
         if (frame.kind == "error") {
             if (frame.resetRequired == true || frame.requestType?.startsWith("speech-") == true ||
+                frame.requestType?.startsWith("bot-") == true ||
                 frame.requestType?.startsWith("file-") == true ||
                 frame.requestType?.startsWith("workspace-changes-") == true ||
                 frame.requestType in setOf("session-agent-preset", "select-agent-preset", "agent-team", "subagents", "agent-team-set-enabled") ||
@@ -897,6 +911,16 @@ class GatewayRuntime(
     }
 
     private suspend fun correlateLocked(frame: GatewayFrame): Correlation {
+        // Bot 请求各自关联 requestId；历史、列表及发送互不占用已有会话的 lane。
+        val botId = frame.requestId?.takeIf { it.startsWith("bot-") }
+        if (botId != null && frame.kind in setOf("bot-result", "bot-subscribed", "error")) {
+            val lane = pendingLanes[botId] ?: return Correlation(false, null)
+            if (!lane.active.request.requestType.startsWith("bot-") || lane.active.generation != connectionGeneration) {
+                return Correlation(false, null)
+            }
+            completeLaneLocked(botId)
+            return Correlation(true, null)
+        }
         // 成员资料使用有 requestId 的独立只读通道，不占用或完成前台 history lane。
         val profileId = frame.requestId?.takeIf { it.startsWith("team-profile-") }
         if (profileId != null && frame.kind in setOf("history", "error")) {
@@ -1375,8 +1399,11 @@ class GatewayRuntime(
             }
             serialized {
                 if (canReconnectLocked()) {
-                    if (!immediate && trustedEndpoints.size > 1) {
-                        endpoint = trustedEndpoints[(trustedEndpoints.indexOf(endpoint) + 1) % trustedEndpoints.size]
+                    val retryEndpoints = selectedConnectionMethod?.let { method ->
+                        trustedEndpoints.filter { GatewayIdentity.connectionMethod(it) == method }
+                    } ?: trustedEndpoints
+                    if (!immediate && retryEndpoints.size > 1) {
+                        endpoint = retryEndpoints[(retryEndpoints.indexOf(endpoint) + 1) % retryEndpoints.size]
                     }
                     openTransportLocked(preserveTurns = true)
                 }

@@ -106,6 +106,7 @@ final class GatewayClient: ObservableObject {
     var credentialID: String?
     var expectedGatewayID: String?
     var trustedEndpoints: [String] = []
+    var selectedConnectionMethod: GatewayAddressMethod?
     var onIdentity: ((GatewayFrame, String) throws -> Void)?
     var probeOnly = false
     private var reconnectAttempt = 0
@@ -247,6 +248,9 @@ final class GatewayClient: ObservableObject {
     var onCommandFrame: ((String) -> Void)?
     var onDeviceToolFrame: ((String) -> Void)?
     var onSpeechFrame: ((String) -> Void)?
+    var onBotFrame: ((String) -> Void)?
+    var supportsFileUploads: Bool { diagnosticsCapabilities.contains("file-upload-v1") }
+    var supportsBots: Bool { diagnosticsCapabilities.contains("bot-v1") }
     var onConnectionFailure: ((String) -> Void)?
     /// 传输生命周期与错误弹窗分离；静默恢复也必须废弃旧请求。
     var onConnectionInvalidated: (() -> Void)?
@@ -952,6 +956,15 @@ final class GatewayClient: ObservableObject {
         write(payload, to: socket)
     }
 
+    @discardableResult
+    func sendBotRequest(_ payload: String) -> Bool {
+        guard state.isConnected, supportsBots,
+              let object = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any],
+              let type = object["type"] as? String, type.hasPrefix("bot-") else { return false }
+        send(object)
+        return true
+    }
+
     private func send(_ object: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
         sendRequestPayload(String(decoding: data, as: UTF8.self))
@@ -998,8 +1011,8 @@ final class GatewayClient: ObservableObject {
     nonisolated static func decodeIncomingFrame(_ data: Data) throws -> (GatewayFrame?, String?) {
         struct SpeechEnvelope: Decodable { let kind: String?; let requestType: String? }
         let header = try? JSONDecoder().decode(SpeechEnvelope.self, from: data)
-        if header?.kind?.hasPrefix("device-tool") == true || header?.kind?.hasPrefix("speech-") == true ||
-            (header?.kind == "error" && (header?.requestType?.hasPrefix("speech-") == true || header?.requestType?.hasPrefix("device-tool") == true)) {
+        if header?.kind?.hasPrefix("device-tool") == true || header?.kind?.hasPrefix("speech-") == true || header?.kind?.hasPrefix("bot-") == true ||
+            (header?.kind == "error" && (header?.requestType?.hasPrefix("speech-") == true || header?.requestType?.hasPrefix("device-tool") == true || header?.requestType?.hasPrefix("bot-") == true)) {
             return (nil, String(decoding: data, as: UTF8.self))
         }
         return (try GatewayWireDecoder.decode(data), nil)
@@ -1008,6 +1021,7 @@ final class GatewayClient: ObservableObject {
     private func deliverAuxiliaryFrame(_ json: String) {
         let header = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
         if (header?["kind"] as? String)?.hasPrefix("device-tool") == true || (header?["kind"] as? String == "error" && (header?["requestType"] as? String)?.hasPrefix("device-tool") == true) { onDeviceToolFrame?(json) }
+        else if (header?["kind"] as? String)?.hasPrefix("bot-") == true || (header?["requestType"] as? String)?.hasPrefix("bot-") == true { onBotFrame?(json) }
         else { onSpeechFrame?(json) }
     }
 
@@ -1329,9 +1343,11 @@ final class GatewayClient: ObservableObject {
         reconnectTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(delay)) } catch { return }
             guard let self, !Task.isCancelled, self.wantsConnection, var endpoint = self.endpoint else { return }
-            if self.trustedEndpoints.count > 1,
-               let index = self.trustedEndpoints.firstIndex(of: endpoint.absoluteString),
-               let next = URL(string: self.trustedEndpoints[(index + 1) % self.trustedEndpoints.count]) {
+            let retryEndpoints = self.selectedConnectionMethod.map { method in
+                self.trustedEndpoints.filter { GatewayAddressMethod(endpoint: $0) == method }
+            } ?? self.trustedEndpoints
+            if retryEndpoints.count > 1,
+               let next = URL(string: retryEndpoints[((retryEndpoints.firstIndex(of: endpoint.absoluteString) ?? -1) + 1) % retryEndpoints.count]) {
                 endpoint = next
             }
             self.beginConnection(
